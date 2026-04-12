@@ -2269,6 +2269,7 @@ int main(int argc, char ** argv) {
         test t(inst, lmodel, ctx);
 
         llama_memory_clear(llama_get_memory(ctx), false);
+        llama_perf_context_reset(ctx);
 
         // cool off before the test
         if (params.delay) {
