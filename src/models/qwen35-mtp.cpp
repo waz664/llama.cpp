@@ -2,9 +2,14 @@
 
 void llama_model_qwen35_mtp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-    ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
+    if (!ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 3, false)) {
+        ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
+    }
 
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+    if (hparams.nextn_predict_layers == 0 && ml.get_tensor_meta("mtp.fc.weight") != nullptr) {
+        hparams.nextn_predict_layers = 1;
+    }
     GGML_ASSERT(hparams.nextn_predict_layers > 0   && "QWEN35_MTP requires nextn_predict_layers > 0");
     GGML_ASSERT(hparams.nextn_predict_layers <= hparams.n_layer);
 
@@ -18,7 +23,7 @@ void llama_model_qwen35_mtp::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_qwen35_mtp::load_arch_tensors(llama_model_loader &) {
+void llama_model_qwen35_mtp::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, 0);
@@ -28,35 +33,60 @@ void llama_model_qwen35_mtp::load_arch_tensors(llama_model_loader &) {
         output  = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    const uint32_t n_main = n_layer - hparams.nextn_predict_layers;
-    for (int i = 0; i < n_layer; ++i) {
-        if (static_cast<uint32_t>(i) < n_main) {
-            continue;  // trunk layer — owned by the sibling QWEN35 model
-        }
+    const bool has_sidecar_mtp = ml.get_tensor_meta("mtp.fc.weight") != nullptr;
+    const int i = has_sidecar_mtp ? n_layer - 1 : n_layer - hparams.nextn_predict_layers;
+    auto & layer = layers[i];
 
-        auto & layer = layers[i];
+    if (has_sidecar_mtp) {
+        const int64_t n_embd_k_gqa_i = hparams.n_embd_k_gqa(i);
+        const int64_t n_embd_v_gqa_i = hparams.n_embd_v_gqa(i);
+        auto alias = [this, i](llm_tensor tensor, const char * name) {
+            return LLM_TN_IMPL(this->arch, tensor, nullptr, i, -1, name);
+        };
 
         // MTP block looks like a full-attention Qwen3.5 decoder block.
-        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
+        layer.attn_norm      = create_tensor(alias(LLM_TENSOR_ATTN_NORM,      "mtp.layers.0.attn_norm.weight"), { n_embd }, 0);
+        layer.attn_post_norm = create_tensor(alias(LLM_TENSOR_ATTN_POST_NORM, "mtp.layers.0.post_attention_norm.weight"), { n_embd }, 0);
 
-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, 0);
-        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
-        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
-        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+        layer.wq          = create_tensor(alias(LLM_TENSOR_ATTN_Q,      "mtp.layers.0.attn_q.weight"), { n_embd, n_embd_head_k * n_head * 2 }, 0);
+        layer.wk          = create_tensor(alias(LLM_TENSOR_ATTN_K,      "mtp.layers.0.attn_k.weight"), { n_embd, n_embd_k_gqa_i }, 0);
+        layer.wv          = create_tensor(alias(LLM_TENSOR_ATTN_V,      "mtp.layers.0.attn_v.weight"), { n_embd, n_embd_v_gqa_i }, 0);
+        layer.wo          = create_tensor(alias(LLM_TENSOR_ATTN_OUT,    "mtp.layers.0.attn_output.weight"), { n_embd_head_k * n_head, n_embd }, 0);
+        layer.attn_q_norm = create_tensor(alias(LLM_TENSOR_ATTN_Q_NORM, "mtp.layers.0.attn_q_norm.weight"), { n_embd_head_k }, 0);
+        layer.attn_k_norm = create_tensor(alias(LLM_TENSOR_ATTN_K_NORM, "mtp.layers.0.attn_k_norm.weight"), { n_embd_head_k }, 0);
 
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+        layer.ffn_gate = create_tensor(alias(LLM_TENSOR_FFN_GATE, "mtp.layers.0.ffn_gate.weight"), {n_embd,   n_ff}, 0);
+        layer.ffn_down = create_tensor(alias(LLM_TENSOR_FFN_DOWN, "mtp.layers.0.ffn_down.weight"), {  n_ff, n_embd}, 0);
+        layer.ffn_up   = create_tensor(alias(LLM_TENSOR_FFN_UP,   "mtp.layers.0.ffn_up.weight"), {n_embd,   n_ff}, 0);
 
         // NextN-specific tensors that define the MTP block.
-        layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), { 2 * n_embd, n_embd }, 0);
-        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), { n_embd },              0);
-        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), { n_embd },              0);
-        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), { n_embd, n_vocab },     TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), { n_embd, n_vocab },     TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), { n_embd },              TENSOR_NOT_REQUIRED);
+        layer.nextn.eh_proj          = create_tensor(alias(LLM_TENSOR_NEXTN_EH_PROJ,          "mtp.fc.weight"), { 2 * n_embd, n_embd }, 0);
+        layer.nextn.enorm            = create_tensor(alias(LLM_TENSOR_NEXTN_ENORM,            "mtp.pre_fc_norm_embedding.weight"), { n_embd }, 0);
+        layer.nextn.hnorm            = create_tensor(alias(LLM_TENSOR_NEXTN_HNORM,            "mtp.pre_fc_norm_hidden.weight"), { n_embd }, 0);
+        layer.nextn.shared_head_norm = create_tensor(alias(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "mtp.norm.weight"), { n_embd }, TENSOR_NOT_REQUIRED);
+        return;
     }
+
+    // MTP block looks like a full-attention Qwen3.5 decoder block.
+    layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
+    layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
+
+    create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, 0);
+    layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
+    layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
+    layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+
+    layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+    layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+    layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+
+    // NextN-specific tensors that define the MTP block.
+    layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), { 2 * n_embd, n_embd }, 0);
+    layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), { n_embd },              0);
+    layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), { n_embd },              0);
+    layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), { n_embd, n_vocab },     TENSOR_NOT_REQUIRED);
+    layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), { n_embd, n_vocab },     TENSOR_NOT_REQUIRED);
+    layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), { n_embd },              TENSOR_NOT_REQUIRED);
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen35_mtp::build_arch_graph(const llm_graph_params & params) const {
@@ -72,9 +102,11 @@ llama_model_qwen35_mtp::graph::graph(const llama_model & model, const llm_graph_
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // The MTP block lives at the source file's original layer index.
-    const int il = (int) hparams.n_layer - (int) hparams.nextn_predict_layers;
+    // Sidecar MTP GGUFs store the draft block outside blk.*, mapped onto the
+    // trailing runtime layer so KV-cache filtering still works.
+    const int il = (int) hparams.n_layer - 1;
     const auto & layer = model.layers[il];
+    const int64_t n_head_kv_i = hparams.n_head_kv(il);
 
     GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
@@ -140,12 +172,12 @@ llama_model_qwen35_mtp::graph::graph(const llama_model & model, const llm_graph_
     cb(gate, "mtp_gate", il);
 
     ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_i, n_tokens);
     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "mtp_Kcur_normed", il);
 
     ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_i, n_tokens);
     cb(Vcur, "mtp_Vcur", il);
 
     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
