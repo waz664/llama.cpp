@@ -2424,6 +2424,10 @@ const char * llama_model_chat_template(const llama_model * model, const char * n
     if (it == model->gguf_kv.end()) {
         // one-off fix for very popular models (so we are not flooded with issues)
         // do not extend this list unless absolutely necessary
+        if (!name && (model->arch == LLM_ARCH_GEMMA3N || model->arch == LLM_ARCH_GEMMA4)) {
+            return "gemma";
+        }
+
         // Mistral-Small-2503 does not have built-in chat template
         llama_vocab_pre_type pre_type = model->vocab.get_pre_type();
         if (!name && pre_type == LLAMA_VOCAB_PRE_TYPE_TEKKEN && model->layers.size() == 40) {

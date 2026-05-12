@@ -86,6 +86,23 @@
 #define KEY_QWEN35_VISION_SPATIAL_MERGE     "qwen35.vision.spatial_merge_size"
 #define KEY_QWEN35_ATTENTION_RMS_EPS        "qwen35.attention.layer_norm_rms_epsilon"
 
+// Gemma 4 Ollama GGUFs store the vision and audio towers in the same file as
+// the text model and use architecture-scoped metadata instead of clip.* keys.
+#define KEY_GEMMA4_N_EMBD                   "gemma4.embedding_length"
+#define KEY_GEMMA4_VISION_N_EMBD            "gemma4.vision.embedding_length"
+#define KEY_GEMMA4_VISION_N_HEAD            "gemma4.vision.attention.head_count"
+#define KEY_GEMMA4_VISION_N_BLOCK           "gemma4.vision.block_count"
+#define KEY_GEMMA4_VISION_N_FF              "gemma4.vision.feed_forward_length"
+#define KEY_GEMMA4_VISION_PATCH_SIZE        "gemma4.vision.patch_size"
+#define KEY_GEMMA4_VISION_PROJ_SCALE        "gemma4.vision.projector.scale_factor"
+#define KEY_GEMMA4_VISION_LN_EPS            "gemma4.vision.attention.layer_norm_epsilon"
+#define KEY_GEMMA4_AUDIO_N_EMBD             "gemma4.audio.embedding_length"
+#define KEY_GEMMA4_AUDIO_N_HEAD             "gemma4.audio.attention.head_count"
+#define KEY_GEMMA4_AUDIO_N_BLOCK            "gemma4.audio.block_count"
+#define KEY_GEMMA4_AUDIO_N_FF               "gemma4.audio.feed_forward_length"
+#define KEY_GEMMA4_AUDIO_CONV_KERNEL        "gemma4.audio.conv_kernel_size"
+#define KEY_GEMMA4_AUDIO_LN_EPS             "gemma4.audio.attention.layer_norm_epsilon"
+
 
 //
 // tensor name constants

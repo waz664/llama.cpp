@@ -1000,6 +1000,18 @@ struct clip_model_loader {
         return arch == "qwen35" && has_key(KEY_QWEN35_VISION_N_EMBD);
     }
 
+    bool is_gemma4_packed_vision() const {
+        std::string arch;
+        get_string(KEY_ARCH, arch, false);
+        return arch == "gemma4" && has_key(KEY_GEMMA4_VISION_N_EMBD);
+    }
+
+    bool is_gemma4_packed_audio() const {
+        std::string arch;
+        get_string(KEY_ARCH, arch, false);
+        return arch == "gemma4" && has_key(KEY_GEMMA4_AUDIO_N_EMBD);
+    }
+
     // TODO @ngxson : we should not pass clip_ctx here, it should be clip_model
     clip_model_loader(const char * fname, bool skip_tensors = false) : fname(fname) {
         struct ggml_context * meta = nullptr;
@@ -1040,6 +1052,12 @@ struct clip_model_loader {
 
             if (!has_vision && is_qwen35_packed_vision()) {
                 has_vision = true;
+            }
+            if (!has_vision && is_gemma4_packed_vision()) {
+                has_vision = true;
+            }
+            if (!has_audio && is_gemma4_packed_audio()) {
+                has_audio = true;
             }
 
             if (has_vision) {
@@ -1090,9 +1108,14 @@ struct clip_model_loader {
                     get_string(KEY_VISION_PROJ_TYPE, proj_type, false);
                     if (proj_type.empty() && is_qwen35_packed_vision()) {
                         proj_type = PROJECTOR_TYPE_NAMES[PROJECTOR_TYPE_QWEN3VL];
+                    } else if (proj_type.empty() && is_gemma4_packed_vision()) {
+                        proj_type = PROJECTOR_TYPE_NAMES[PROJECTOR_TYPE_GEMMA4V];
                     }
                 } else if (modality == CLIP_MODALITY_AUDIO) {
                     get_string(KEY_AUDIO_PROJ_TYPE, proj_type, false);
+                    if (proj_type.empty() && is_gemma4_packed_audio()) {
+                        proj_type = PROJECTOR_TYPE_NAMES[PROJECTOR_TYPE_GEMMA4A];
+                    }
                 } else {
                     GGML_ABORT("unknown modality");
                 }
@@ -1115,6 +1138,8 @@ struct clip_model_loader {
         const bool is_vision = model.modality == CLIP_MODALITY_VISION;
         const bool is_audio  = model.modality == CLIP_MODALITY_AUDIO;
         const bool is_qwen35_vision = is_vision && is_qwen35_packed_vision();
+        const bool is_gemma4_vision = is_vision && is_gemma4_packed_vision();
+        const bool is_gemma4_audio  = is_audio  && is_gemma4_packed_audio();
 
         // other hparams
         {
@@ -1131,6 +1156,20 @@ struct clip_model_loader {
                 if (ggml_tensor * t = ggml_get_tensor(ctx_meta.get(), string_format(TN_QWEN35_MM_FC2, "bias").c_str())) {
                     hparams.projection_dim = t->ne[0];
                 }
+            } else if (is_gemma4_vision) {
+                get_u32(KEY_GEMMA4_VISION_N_EMBD,     hparams.n_embd);
+                get_u32(KEY_GEMMA4_VISION_N_HEAD,     hparams.n_head);
+                get_u32(KEY_GEMMA4_VISION_N_FF,       hparams.n_ff);
+                get_u32(KEY_GEMMA4_VISION_N_BLOCK,    hparams.n_layer);
+                get_u32(KEY_GEMMA4_N_EMBD,            hparams.projection_dim);
+                get_f32(KEY_GEMMA4_VISION_LN_EPS,     hparams.eps);
+            } else if (is_gemma4_audio) {
+                get_u32(KEY_GEMMA4_AUDIO_N_EMBD,      hparams.n_embd);
+                get_u32(KEY_GEMMA4_AUDIO_N_HEAD,      hparams.n_head);
+                get_u32(KEY_GEMMA4_AUDIO_N_FF,        hparams.n_ff);
+                get_u32(KEY_GEMMA4_AUDIO_N_BLOCK,     hparams.n_layer);
+                get_u32(KEY_GEMMA4_N_EMBD,            hparams.projection_dim);
+                get_f32(KEY_GEMMA4_AUDIO_LN_EPS,      hparams.eps);
             } else {
                 get_u32(string_format(KEY_N_EMBD,         prefix), hparams.n_embd);
                 get_u32(string_format(KEY_N_HEAD,         prefix), hparams.n_head);
@@ -1146,6 +1185,10 @@ struct clip_model_loader {
                     if (ggml_tensor * t = ggml_get_tensor(ctx_meta.get(), TN_QWEN35_POS_EMBD)) {
                         hparams.image_size = (int) std::sqrt((float) t->ne[1]) * hparams.patch_size;
                     }
+                } else if (is_gemma4_vision) {
+                    get_u32(KEY_GEMMA4_VISION_PATCH_SIZE, hparams.patch_size);
+                    // Gemma 4 uses dynamic image sizes and 2-D learned positions.
+                    hparams.image_size = 0;
                 } else {
                     get_u32(KEY_IMAGE_SIZE, hparams.image_size);
                     get_u32(KEY_PATCH_SIZE, hparams.patch_size);
@@ -1169,7 +1212,13 @@ struct clip_model_loader {
                     }
                 }
             } else if (is_audio) {
-                get_u32(KEY_A_NUM_MEL_BINS, hparams.n_mel_bins);
+                if (is_gemma4_audio) {
+                    // Gemma 4 audio uses 128 mel bins; the Ollama metadata omits
+                    // the legacy clip.audio.num_mel_bins key.
+                    hparams.n_mel_bins = 128;
+                } else {
+                    get_u32(KEY_A_NUM_MEL_BINS, hparams.n_mel_bins);
+                }
                 // some hparams are unused, but still need to set to avoid issues
                 hparams.image_size = 0;
                 hparams.patch_size = 1;
@@ -1226,13 +1275,21 @@ struct clip_model_loader {
             if (is_vision) {
                 int idx_mean = gguf_find_key(ctx_gguf.get(), is_qwen35_vision ? KEY_QWEN35_VISION_IMAGE_MEAN : KEY_IMAGE_MEAN);
                 int idx_std  = gguf_find_key(ctx_gguf.get(), is_qwen35_vision ? KEY_QWEN35_VISION_IMAGE_STD  : KEY_IMAGE_STD);
-                GGML_ASSERT(idx_mean >= 0 && "image_mean not found");
-                GGML_ASSERT(idx_std >= 0  && "image_std not found");
-                const float * mean_data = (const float *) gguf_get_arr_data(ctx_gguf.get(), idx_mean);
-                const float * std_data  = (const float *) gguf_get_arr_data(ctx_gguf.get(), idx_std);
-                for (int i = 0; i < 3; ++i) {
-                    hparams.image_mean[i] = mean_data[i];
-                    hparams.image_std[i]  = std_data[i];
+                if (idx_mean >= 0 && idx_std >= 0) {
+                    const float * mean_data = (const float *) gguf_get_arr_data(ctx_gguf.get(), idx_mean);
+                    const float * std_data  = (const float *) gguf_get_arr_data(ctx_gguf.get(), idx_std);
+                    for (int i = 0; i < 3; ++i) {
+                        hparams.image_mean[i] = mean_data[i];
+                        hparams.image_std[i]  = std_data[i];
+                    }
+                } else if (is_gemma4_vision || model.proj_type == PROJECTOR_TYPE_GEMMA3NV) {
+                    for (int i = 0; i < 3; ++i) {
+                        hparams.image_mean[i] = 0.0f;
+                        hparams.image_std[i]  = 1.0f;
+                    }
+                } else {
+                    GGML_ASSERT(idx_mean >= 0 && "image_mean not found");
+                    GGML_ASSERT(idx_std >= 0  && "image_std not found");
                 }
             }
 
@@ -1685,6 +1742,7 @@ struct clip_model_loader {
 
         // TODO @ngxson : support both audio and video in the future
         const char * prefix = model.modality == CLIP_MODALITY_AUDIO ? "a" : "v";
+        const bool is_gemma4_packed_audio = model.modality == CLIP_MODALITY_AUDIO && this->is_gemma4_packed_audio();
 
         // get offsets
         for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
@@ -2459,10 +2517,18 @@ struct clip_model_loader {
                         model.sscp_conv_b[i] = get_tensor(string_format(TN_A_CONV1D, i, "bias"), false);
                         model.sscp_norm_w[i] = get_tensor(string_format(TN_A_CONV1D_NORM, i, "weight"), false);
                     }
-                    model.sscp_inp_proj_w = get_tensor(string_format(TN_A_INP_PROJ, "weight"));
+                    model.sscp_inp_proj_w = get_tensor(string_format(TN_A_INP_PROJ, "weight"), false);
                     model.sscp_inp_proj_b = get_tensor(string_format(TN_A_INP_PROJ, "bias"), false);
-                    model.audio_out_proj_w = get_tensor(string_format(TN_A_OUT_PROJ, "weight"), false);
-                    model.audio_out_proj_b = get_tensor(string_format(TN_A_OUT_PROJ, "bias"), false);
+                    if (!model.sscp_inp_proj_w && is_gemma4_packed_audio) {
+                        model.sscp_inp_proj_w = get_tensor(string_format(TN_A_OUT_PROJ, "weight"), false);
+                        model.sscp_inp_proj_b = get_tensor(string_format(TN_A_OUT_PROJ, "bias"), false);
+                    }
+                    model.audio_out_proj_w = is_gemma4_packed_audio
+                        ? get_tensor(string_format(TN_MM_AUDIO_FC, "weight"), false)
+                        : get_tensor(string_format(TN_A_OUT_PROJ, "weight"), false);
+                    model.audio_out_proj_b = is_gemma4_packed_audio
+                        ? get_tensor(string_format(TN_MM_AUDIO_FC, "bias"), false)
+                        : get_tensor(string_format(TN_A_OUT_PROJ, "bias"), false);
                     // audio multimodal embedder (mm.a.* namespace, not mm.*)
                     model.mm_soft_emb_norm_w = get_tensor(string_format(TN_A_MM_SOFT_EMB_N, "weight"), false);
                     model.mm_input_proj_w    = get_tensor(string_format(TN_A_MM_INP_PROJ, "weight"), false);
@@ -3558,6 +3624,16 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
     };
 
+    auto set_input_f32_if_exists = [&gf](const char * name, std::vector<float> & values) {
+        ggml_tensor * cur = ggml_graph_get_tensor(gf, name);
+        if (!cur) {
+            return;
+        }
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
+        ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
+    };
+
     auto set_input_i32 = [&get_inp_tensor](const char * name, std::vector<int32_t> & values) {
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_I32);
@@ -4150,7 +4226,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                             pos_emb[p * n_embd + i + num_timescales] = cosf(scaled);
                         }
                     }
-                    set_input_f32("pos_emb", pos_emb);
+                    set_input_f32_if_exists("pos_emb", pos_emb);
                 }
             } break;
         case PROJECTOR_TYPE_LFM2A:
