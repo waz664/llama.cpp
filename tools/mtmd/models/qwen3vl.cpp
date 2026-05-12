@@ -14,28 +14,49 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     int mrope_sections[4] = {d_head/4, d_head/4, d_head/4, d_head/4};
 
     ggml_tensor * inp_raw = build_inp_raw();
-    ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+    ggml_tensor * inp = nullptr;
 
     GGML_ASSERT(img.nx % (patch_size * 2) == 0);
     GGML_ASSERT(img.ny % (patch_size * 2) == 0);
 
-    // second conv dimension
-    {
-        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
-        inp = ggml_add(ctx0, inp, inp_1);
+    if (model.patch_embeddings_1) {
+        inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
 
-        inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
-        inp = ggml_cont_4d(
-            ctx0, inp,
-            n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
-        inp = ggml_reshape_4d(
-            ctx0, inp,
-            n_embd * 2, n_patches_x / 2, 2, batch_size * (n_patches_y / 2));
-        inp = ggml_permute(ctx0, inp, 0, 2, 1, 3);
-        inp = ggml_cont_3d(
-            ctx0, inp,
-            n_embd, n_patches_x * n_patches_y, batch_size);
+        // second conv dimension
+        ggml_tensor * inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+        inp = ggml_add(ctx0, inp, inp_1);
+    } else {
+        GGML_ASSERT(model.patch_embeddings_0->ne[2] == 2);
+        GGML_ASSERT(model.patch_embeddings_0->ne[3] == n_embd * 3);
+
+        const size_t ts = ggml_element_size(model.patch_embeddings_0);
+        const size_t nb1 = patch_size * ts;
+        const size_t nb2 = patch_size * patch_size * 2 * ts;
+        const size_t nb3 = patch_size * patch_size * 2 * 3 * ts;
+
+        ggml_tensor * patch_0 = ggml_view_4d(ctx0, model.patch_embeddings_0, patch_size, patch_size, 3, n_embd, nb1, nb2, nb3, 0);
+        ggml_tensor * patch_1 = ggml_view_4d(ctx0, model.patch_embeddings_0, patch_size, patch_size, 3, n_embd, nb1, nb2, nb3, patch_size * patch_size * ts);
+        patch_0 = ggml_cont(ctx0, patch_0);
+        patch_1 = ggml_cont(ctx0, patch_1);
+        cb(patch_0, "patch_embd_0", -1);
+        cb(patch_1, "patch_embd_1", -1);
+
+        inp = ggml_conv_2d(ctx0, patch_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+        ggml_tensor * inp_1 = ggml_conv_2d(ctx0, patch_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+        inp = ggml_add(ctx0, inp, inp_1);
     }
+
+    inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);  // [w, h, c, b] -> [c, w, h, b]
+    inp = ggml_cont_4d(
+        ctx0, inp,
+        n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
+    inp = ggml_reshape_4d(
+        ctx0, inp,
+        n_embd * 2, n_patches_x / 2, 2, batch_size * (n_patches_y / 2));
+    inp = ggml_permute(ctx0, inp, 0, 2, 1, 3);
+    inp = ggml_cont_3d(
+        ctx0, inp,
+        n_embd, n_patches_x * n_patches_y, batch_size);
 
     // add patch bias
     if (model.patch_bias != nullptr) {
@@ -85,23 +106,36 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
 
         // self-attention
         {
-            cur = build_mm(layer.qkv_w, cur);
-            cur = ggml_add(ctx0, cur, layer.qkv_b);
+            ggml_tensor * Qcur = nullptr;
+            ggml_tensor * Kcur = nullptr;
+            ggml_tensor * Vcur = nullptr;
+            if (layer.qkv_w) {
+                cur = build_mm(layer.qkv_w, cur);
+                cur = ggml_add(ctx0, cur, layer.qkv_b);
 
-            ggml_tensor * Qcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
-                    /* nb1    */ ggml_row_size(cur->type, d_head),
-                    /* nb2    */ cur->nb[1],
-                    /* offset */ 0);
+                Qcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
+                        /* nb1    */ ggml_row_size(cur->type, d_head),
+                        /* nb2    */ cur->nb[1],
+                        /* offset */ 0);
 
-            ggml_tensor * Kcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
-                    /* nb1    */ ggml_row_size(cur->type, d_head),
-                    /* nb2    */ cur->nb[1],
-                    /* offset */ ggml_row_size(cur->type, n_embd));
+                Kcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
+                        /* nb1    */ ggml_row_size(cur->type, d_head),
+                        /* nb2    */ cur->nb[1],
+                        /* offset */ ggml_row_size(cur->type, n_embd));
 
-            ggml_tensor * Vcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
-                    /* nb1    */ ggml_row_size(cur->type, d_head),
-                    /* nb2    */ cur->nb[1],
-                    /* offset */ ggml_row_size(cur->type, 2 * n_embd));
+                Vcur = ggml_view_3d(ctx0, cur, d_head, n_head, n_pos,
+                        /* nb1    */ ggml_row_size(cur->type, d_head),
+                        /* nb2    */ cur->nb[1],
+                        /* offset */ ggml_row_size(cur->type, 2 * n_embd));
+            } else {
+                Qcur = ggml_add(ctx0, build_mm(layer.q_w, cur), layer.q_b);
+                Kcur = ggml_add(ctx0, build_mm(layer.k_w, cur), layer.k_b);
+                Vcur = ggml_add(ctx0, build_mm(layer.v_w, cur), layer.v_b);
+
+                Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
+                Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
+                Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
+            }
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);

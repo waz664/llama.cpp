@@ -278,6 +278,10 @@ ggml_tensor * clip_graph::resize_position_embeddings(uint32_t interpolation_mode
 
     GGML_ASSERT(pos_embd);
 
+    if (pos_embd->type != GGML_TYPE_F32) {
+        pos_embd = ggml_cast(ctx0, pos_embd, GGML_TYPE_F32);
+    }
+
     if (height == n_per_side && width == n_per_side) {
         return pos_embd;
     }
@@ -986,6 +990,16 @@ struct clip_model_loader {
     bool has_vision = false;
     bool has_audio  = false;
 
+    bool has_key(const char * key) const {
+        return gguf_find_key(ctx_gguf.get(), key) >= 0;
+    }
+
+    bool is_qwen35_packed_vision() const {
+        std::string arch;
+        get_string(KEY_ARCH, arch, false);
+        return arch == "qwen35" && has_key(KEY_QWEN35_VISION_N_EMBD);
+    }
+
     // TODO @ngxson : we should not pass clip_ctx here, it should be clip_model
     clip_model_loader(const char * fname, bool skip_tensors = false) : fname(fname) {
         struct ggml_context * meta = nullptr;
@@ -1023,6 +1037,10 @@ struct clip_model_loader {
         {
             get_bool(KEY_HAS_VISION_ENC, has_vision, false);
             get_bool(KEY_HAS_AUDIO_ENC,  has_audio,  false);
+
+            if (!has_vision && is_qwen35_packed_vision()) {
+                has_vision = true;
+            }
 
             if (has_vision) {
                 LOG_INF("%s: has vision encoder\n", __func__);
@@ -1070,6 +1088,9 @@ struct clip_model_loader {
             if (proj_type.empty()) {
                 if (modality == CLIP_MODALITY_VISION) {
                     get_string(KEY_VISION_PROJ_TYPE, proj_type, false);
+                    if (proj_type.empty() && is_qwen35_packed_vision()) {
+                        proj_type = PROJECTOR_TYPE_NAMES[PROJECTOR_TYPE_QWEN3VL];
+                    }
                 } else if (modality == CLIP_MODALITY_AUDIO) {
                     get_string(KEY_AUDIO_PROJ_TYPE, proj_type, false);
                 } else {
@@ -1093,20 +1114,42 @@ struct clip_model_loader {
 
         const bool is_vision = model.modality == CLIP_MODALITY_VISION;
         const bool is_audio  = model.modality == CLIP_MODALITY_AUDIO;
+        const bool is_qwen35_vision = is_vision && is_qwen35_packed_vision();
 
         // other hparams
         {
             const char * prefix = is_vision ? "vision" : "audio";
-            get_u32(string_format(KEY_N_EMBD,         prefix), hparams.n_embd);
-            get_u32(string_format(KEY_N_HEAD,         prefix), hparams.n_head);
-            get_u32(string_format(KEY_N_FF,           prefix), hparams.n_ff);
-            get_u32(string_format(KEY_N_BLOCK,        prefix), hparams.n_layer);
-            get_u32(string_format(KEY_PROJ_DIM,       prefix), hparams.projection_dim);
-            get_f32(string_format(KEY_LAYER_NORM_EPS, prefix), hparams.eps);
+            if (is_qwen35_vision) {
+                get_u32(KEY_QWEN35_VISION_N_EMBD,      hparams.n_embd);
+                get_u32(KEY_QWEN35_VISION_N_HEAD,      hparams.n_head);
+                get_u32(KEY_QWEN35_VISION_N_BLOCK,     hparams.n_layer);
+                get_f32(KEY_QWEN35_ATTENTION_RMS_EPS,  hparams.eps, false);
+
+                if (ggml_tensor * t = ggml_get_tensor(ctx_meta.get(), string_format(TN_QWEN35_FFN_UP, "v", 0, "bias").c_str())) {
+                    hparams.n_ff = t->ne[0];
+                }
+                if (ggml_tensor * t = ggml_get_tensor(ctx_meta.get(), string_format(TN_QWEN35_MM_FC2, "bias").c_str())) {
+                    hparams.projection_dim = t->ne[0];
+                }
+            } else {
+                get_u32(string_format(KEY_N_EMBD,         prefix), hparams.n_embd);
+                get_u32(string_format(KEY_N_HEAD,         prefix), hparams.n_head);
+                get_u32(string_format(KEY_N_FF,           prefix), hparams.n_ff);
+                get_u32(string_format(KEY_N_BLOCK,        prefix), hparams.n_layer);
+                get_u32(string_format(KEY_PROJ_DIM,       prefix), hparams.projection_dim);
+                get_f32(string_format(KEY_LAYER_NORM_EPS, prefix), hparams.eps);
+            }
 
             if (is_vision) {
-                get_u32(KEY_IMAGE_SIZE, hparams.image_size);
-                get_u32(KEY_PATCH_SIZE, hparams.patch_size);
+                if (is_qwen35_vision) {
+                    get_u32(KEY_QWEN35_VISION_PATCH_SIZE, hparams.patch_size);
+                    if (ggml_tensor * t = ggml_get_tensor(ctx_meta.get(), TN_QWEN35_POS_EMBD)) {
+                        hparams.image_size = (int) std::sqrt((float) t->ne[1]) * hparams.patch_size;
+                    }
+                } else {
+                    get_u32(KEY_IMAGE_SIZE, hparams.image_size);
+                    get_u32(KEY_PATCH_SIZE, hparams.patch_size);
+                }
                 get_i32(KEY_MINICPMV_VERSION, hparams.minicpmv_version, false); // legacy
                 get_u32(KEY_MINICPMV_QUERY_NUM, hparams.minicpmv_query_num, false);
                 if (hparams.minicpmv_query_num == 0) {
@@ -1153,7 +1196,7 @@ struct clip_model_loader {
             hparams.warmup_image_size = hparams.image_size;
 
             {
-                bool use_gelu = false;
+                bool use_gelu = is_qwen35_vision;
                 bool use_silu = false;
                 get_bool(KEY_USE_GELU, use_gelu, false);
                 get_bool(KEY_USE_SILU, use_silu, false);
@@ -1181,8 +1224,8 @@ struct clip_model_loader {
             }
 
             if (is_vision) {
-                int idx_mean = gguf_find_key(ctx_gguf.get(), KEY_IMAGE_MEAN);
-                int idx_std  = gguf_find_key(ctx_gguf.get(), KEY_IMAGE_STD);
+                int idx_mean = gguf_find_key(ctx_gguf.get(), is_qwen35_vision ? KEY_QWEN35_VISION_IMAGE_MEAN : KEY_IMAGE_MEAN);
+                int idx_std  = gguf_find_key(ctx_gguf.get(), is_qwen35_vision ? KEY_QWEN35_VISION_IMAGE_STD  : KEY_IMAGE_STD);
                 GGML_ASSERT(idx_mean >= 0 && "image_mean not found");
                 GGML_ASSERT(idx_std >= 0  && "image_std not found");
                 const float * mean_data = (const float *) gguf_get_arr_data(ctx_gguf.get(), idx_mean);
@@ -1390,11 +1433,18 @@ struct clip_model_loader {
                     {
                         hparams.n_merge = 2; // default value for Qwen 2 and 2.5
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
-                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        if (is_qwen35_vision) {
+                            get_u32(KEY_QWEN35_VISION_SPATIAL_MERGE, hparams.n_merge, false);
+                            get_u32(KEY_QWEN35_VISION_SHORTEST_EDGE, hparams.image_min_pixels, false);
+                            get_u32(KEY_QWEN35_VISION_LONGEST_EDGE,  hparams.image_max_pixels, false);
+                            hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        } else {
+                            get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                            // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
+                            hparams.set_limit_image_tokens(8, 4096);
+                            hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        }
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
-                        // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
-                        hparams.set_limit_image_tokens(8, 4096);
-                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
@@ -1697,11 +1747,20 @@ struct clip_model_loader {
         model.patch_bias = get_tensor(TN_PATCH_BIAS, false);
         model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   false);
         model.patch_embeddings_1 = get_tensor(TN_PATCH_EMBD_1, false);
+        if (!model.patch_bias) {
+            model.patch_bias = get_tensor(TN_QWEN35_PATCH_BIAS, false);
+        }
+        if (!model.patch_embeddings_0) {
+            model.patch_embeddings_0 = get_tensor(TN_QWEN35_PATCH_EMBD, false);
+        }
 
         model.norm_embd_w = get_tensor(string_format(TN_NORM_EMBD, "weight"), false);
         model.norm_embd_b = get_tensor(string_format(TN_NORM_EMBD, "bias"),   false);
 
         model.position_embeddings = get_tensor(string_format(TN_POS_EMBD, prefix), false);
+        if (!model.position_embeddings) {
+            model.position_embeddings = get_tensor(TN_QWEN35_POS_EMBD, false);
+        }
 
         const bool has_standard_layers = (
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV);
@@ -1733,14 +1792,24 @@ struct clip_model_loader {
             layer.qkv_b  = get_tensor(string_format(TN_ATTN_QKV,    prefix, il, "bias"), false);
             layer.ln_1_b = get_tensor(string_format(TN_LN_1,        prefix, il, "bias"), false);
             layer.ln_2_b = get_tensor(string_format(TN_LN_2,        prefix, il, "bias"), false);
+            if (!layer.ln_1_w) layer.ln_1_w = get_tensor(string_format(TN_QWEN35_LN_1, prefix, il, "weight"), false);
+            if (!layer.ln_1_b) layer.ln_1_b = get_tensor(string_format(TN_QWEN35_LN_1, prefix, il, "bias"),   false);
+            if (!layer.ln_2_w) layer.ln_2_w = get_tensor(string_format(TN_QWEN35_LN_2, prefix, il, "weight"), false);
+            if (!layer.ln_2_b) layer.ln_2_b = get_tensor(string_format(TN_QWEN35_LN_2, prefix, il, "bias"),   false);
 
             // ffn
-            layer.ff_up_w   = get_tensor(string_format(TN_FFN_UP,   prefix, il, "weight"));
+            layer.ff_up_w   = get_tensor(string_format(TN_FFN_UP,   prefix, il, "weight"), false);
             layer.ff_up_b   = get_tensor(string_format(TN_FFN_UP,   prefix, il, "bias"),   false);
             layer.ff_gate_w = get_tensor(string_format(TN_FFN_GATE, prefix, il, "weight"), false);
             layer.ff_gate_b = get_tensor(string_format(TN_FFN_GATE, prefix, il, "bias"),   false);
-            layer.ff_down_w = get_tensor(string_format(TN_FFN_DOWN, prefix, il, "weight"));
+            layer.ff_down_w = get_tensor(string_format(TN_FFN_DOWN, prefix, il, "weight"), false);
             layer.ff_down_b = get_tensor(string_format(TN_FFN_DOWN, prefix, il, "bias"),   false);
+            if (!layer.ff_up_w)   layer.ff_up_w   = get_tensor(string_format(TN_QWEN35_FFN_UP,   prefix, il, "weight"), false);
+            if (!layer.ff_up_b)   layer.ff_up_b   = get_tensor(string_format(TN_QWEN35_FFN_UP,   prefix, il, "bias"),   false);
+            if (!layer.ff_down_w) layer.ff_down_w = get_tensor(string_format(TN_QWEN35_FFN_DOWN, prefix, il, "weight"), false);
+            if (!layer.ff_down_b) layer.ff_down_b = get_tensor(string_format(TN_QWEN35_FFN_DOWN, prefix, il, "bias"),   false);
+            GGML_ASSERT(layer.ff_up_w);
+            GGML_ASSERT(layer.ff_down_w);
 
 
             // qwen3vl deepstack layer
@@ -1921,10 +1990,16 @@ struct clip_model_loader {
                 } break;
             case PROJECTOR_TYPE_QWEN3VL:
                 {
-                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
-                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
-                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
-                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"), false);
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"), false);
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"), false);
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
+                    if (!model.mm_0_w) model.mm_0_w = get_tensor(string_format(TN_QWEN35_MM_FC1, "weight"));
+                    if (!model.mm_0_b) model.mm_0_b = get_tensor(string_format(TN_QWEN35_MM_FC1, "bias"));
+                    if (!model.mm_1_w) model.mm_1_w = get_tensor(string_format(TN_QWEN35_MM_FC2, "weight"));
+                    if (!model.mm_1_b) model.mm_1_b = get_tensor(string_format(TN_QWEN35_MM_FC2, "bias"));
+                    if (!model.post_ln_w) model.post_ln_w = get_tensor(string_format(TN_QWEN35_MM_NORM, "weight"), false);
+                    if (!model.post_ln_b) model.post_ln_b = get_tensor(string_format(TN_QWEN35_MM_NORM, "bias"), false);
                 } break;
             case PROJECTOR_TYPE_STEP3VL:
                 {
@@ -2650,6 +2725,60 @@ struct clip_model_loader {
                 } break;
             default:
                 GGML_ASSERT(false && "unknown projector type");
+        }
+
+        if (model.proj_type == PROJECTOR_TYPE_QWEN3VL && is_qwen35_packed_vision()) {
+            auto require_tensor = [&](ggml_tensor * tensor, const char * name) {
+                if (!tensor) {
+                    throw std::runtime_error(string_format("%s: missing required Qwen3.5 vision tensor %s\n", __func__, name));
+                }
+            };
+
+            require_tensor(model.patch_embeddings_0, TN_QWEN35_PATCH_EMBD);
+            require_tensor(model.patch_bias,         TN_QWEN35_PATCH_BIAS);
+            require_tensor(model.position_embeddings, TN_QWEN35_POS_EMBD);
+            require_tensor(model.mm_0_w, string_format(TN_QWEN35_MM_FC1, "weight").c_str());
+            require_tensor(model.mm_0_b, string_format(TN_QWEN35_MM_FC1, "bias").c_str());
+            require_tensor(model.mm_1_w, string_format(TN_QWEN35_MM_FC2, "weight").c_str());
+            require_tensor(model.mm_1_b, string_format(TN_QWEN35_MM_FC2, "bias").c_str());
+
+            if (model.patch_embeddings_1 == nullptr) {
+                const auto * pe = model.patch_embeddings_0;
+                if (pe->ne[0] != hparams.patch_size || pe->ne[1] != hparams.patch_size || pe->ne[2] != 2 || pe->ne[3] != hparams.n_embd * 3) {
+                    throw std::runtime_error(string_format(
+                        "%s: unsupported packed Qwen3.5 patch embedding shape for %s; expected [%d, %d, 2, %d], got [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                        __func__, TN_QWEN35_PATCH_EMBD,
+                        hparams.patch_size, hparams.patch_size, hparams.n_embd * 3,
+                        pe->ne[0], pe->ne[1], pe->ne[2], pe->ne[3]));
+                }
+            }
+
+            const int pos_per_side = (int) std::sqrt((float) model.position_embeddings->ne[1]);
+            if (pos_per_side * pos_per_side != model.position_embeddings->ne[1]) {
+                throw std::runtime_error(string_format(
+                    "%s: unsupported Qwen3.5 position embedding shape for %s; position count must be square, got %" PRId64 "\n",
+                    __func__, TN_QWEN35_POS_EMBD, model.position_embeddings->ne[1]));
+            }
+
+            for (int il = 0; il < hparams.n_layer; ++il) {
+                const auto & layer = model.layers[il];
+                const bool has_qkv = layer.qkv_w && layer.qkv_b;
+                const bool has_split_qkv = layer.q_w && layer.q_b && layer.k_w && layer.k_b && layer.v_w && layer.v_b;
+                if (!has_qkv && !has_split_qkv) {
+                    throw std::runtime_error(string_format(
+                        "%s: Qwen3.5 vision layer %d must have either fused qkv or split q/k/v tensors\n",
+                        __func__, il));
+                }
+                require_tensor(layer.o_w, string_format(TN_ATTN_OUTPUT, prefix, il, "weight").c_str());
+                require_tensor(layer.ln_1_w, string_format(TN_QWEN35_LN_1, prefix, il, "weight").c_str());
+                require_tensor(layer.ln_1_b, string_format(TN_QWEN35_LN_1, prefix, il, "bias").c_str());
+                require_tensor(layer.ln_2_w, string_format(TN_QWEN35_LN_2, prefix, il, "weight").c_str());
+                require_tensor(layer.ln_2_b, string_format(TN_QWEN35_LN_2, prefix, il, "bias").c_str());
+                require_tensor(layer.ff_up_w, string_format(TN_QWEN35_FFN_UP, prefix, il, "weight").c_str());
+                require_tensor(layer.ff_up_b, string_format(TN_QWEN35_FFN_UP, prefix, il, "bias").c_str());
+                require_tensor(layer.ff_down_w, string_format(TN_QWEN35_FFN_DOWN, prefix, il, "weight").c_str());
+                require_tensor(layer.ff_down_b, string_format(TN_QWEN35_FFN_DOWN, prefix, il, "bias").c_str());
+            }
         }
 
         // load data

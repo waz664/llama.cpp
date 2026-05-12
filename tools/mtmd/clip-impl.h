@@ -18,6 +18,7 @@
 #define MTMD_INTERNAL_HEADER
 
 #define KEY_FTYPE               "general.file_type"
+#define KEY_ARCH                "general.architecture"
 #define KEY_NAME                "general.name"
 #define KEY_DESCRIPTION         "general.description"
 #define KEY_PROJ_TYPE           "clip.projector_type"
@@ -72,6 +73,19 @@
 
 #define KEY_AUDIO_SUBSAMPLING_FACTOR "clip.audio.subsampling_factor"
 
+// Qwen3.5 Ollama GGUFs store the vision tower in the same file as the text
+// model and use architecture-scoped metadata instead of clip.* metadata.
+#define KEY_QWEN35_VISION_N_EMBD            "qwen35.vision.embedding_length"
+#define KEY_QWEN35_VISION_N_HEAD            "qwen35.vision.attention.head_count"
+#define KEY_QWEN35_VISION_N_BLOCK           "qwen35.vision.block_count"
+#define KEY_QWEN35_VISION_PATCH_SIZE        "qwen35.vision.patch_size"
+#define KEY_QWEN35_VISION_IMAGE_MEAN        "qwen35.vision.image_mean"
+#define KEY_QWEN35_VISION_IMAGE_STD         "qwen35.vision.image_std"
+#define KEY_QWEN35_VISION_SHORTEST_EDGE     "qwen35.vision.shortest_edge"
+#define KEY_QWEN35_VISION_LONGEST_EDGE      "qwen35.vision.longest_edge"
+#define KEY_QWEN35_VISION_SPATIAL_MERGE     "qwen35.vision.spatial_merge_size"
+#define KEY_QWEN35_ATTENTION_RMS_EPS        "qwen35.attention.layer_norm_rms_epsilon"
+
 
 //
 // tensor name constants
@@ -125,6 +139,18 @@
 #define TN_DEEPSTACK_NORM  "v.deepstack.%d.norm.%s"     // qwen3vl deepstack
 #define TN_DEEPSTACK_FC1   "v.deepstack.%d.fc1.%s"      // qwen3vl deepstack
 #define TN_DEEPSTACK_FC2   "v.deepstack.%d.fc2.%s"      // qwen3vl deepstack
+
+// Qwen3.5 packed multimodal GGUF tensor aliases.
+#define TN_QWEN35_PATCH_EMBD  "v.patch_embed.weight"
+#define TN_QWEN35_PATCH_BIAS  "v.patch_embed.bias"
+#define TN_QWEN35_POS_EMBD    "v.pos_embed.weight"
+#define TN_QWEN35_LN_1        "%s.blk.%d.norm1.%s"
+#define TN_QWEN35_LN_2        "%s.blk.%d.norm2.%s"
+#define TN_QWEN35_FFN_UP      "%s.blk.%d.mlp.linear_fc1.%s"
+#define TN_QWEN35_FFN_DOWN    "%s.blk.%d.mlp.linear_fc2.%s"
+#define TN_QWEN35_MM_FC1      "v.merger.linear_fc1.%s"
+#define TN_QWEN35_MM_FC2      "v.merger.linear_fc2.%s"
+#define TN_QWEN35_MM_NORM     "v.merger.norm.%s"
 
 // mimicpmv
 #define TN_MINICPMV_POS_EMBD_K "resampler.pos_embed_k"

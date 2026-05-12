@@ -5021,6 +5021,17 @@ class Qwen3VLVisionModel(MmprojModel):
             if merge_size is not None:
                 self.gguf_writer.add_vision_spatial_merge_size(int(merge_size))
 
+            min_pixels = self.hparams_vision.get("shortest_edge", self.hparams_vision.get("min_pixels"))
+            max_pixels = self.hparams_vision.get("longest_edge", self.hparams_vision.get("max_pixels"))
+            if min_pixels is None:
+                min_pixels = self.preprocessor_config.get("shortest_edge", self.preprocessor_config.get("min_pixels"))
+            if max_pixels is None:
+                max_pixels = self.preprocessor_config.get("longest_edge", self.preprocessor_config.get("max_pixels"))
+            if min_pixels is not None:
+                self.gguf_writer.add_vision_min_pixels(int(min_pixels))
+            if max_pixels is not None:
+                self.gguf_writer.add_vision_max_pixels(int(max_pixels))
+
         # Use text config's rms_norm_eps for vision attention layernorm eps
         rms_norm_eps = self.global_config.get("text_config", {}).get("rms_norm_eps", 1e-6)
         self.gguf_writer.add_vision_attention_layernorm_eps(rms_norm_eps)
